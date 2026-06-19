@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+pydantic
+pyvts
+ollama
+sounddevice
+numpy
+SpeechRecognition
+kokoro-onnx
+miniaudio
