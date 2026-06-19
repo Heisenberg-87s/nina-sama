@@ -1,0 +1,15 @@
+*.onnx
+*.bin
+*.pth
+*.pt
+__pycache__/
+.venv/
+venv/
+*.wav
+*.mp3
+*.txt
+*.backup*
+*BACKUP*.py
+memories.json
+songs/
+voice-trainning/
