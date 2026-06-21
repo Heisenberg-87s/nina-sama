@@ -11,7 +11,9 @@ import os
 import subprocess
 import urllib.request
 import json
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+import io
+import uvicorn
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, File, UploadFile, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from ollama import Client
@@ -29,17 +31,18 @@ VOLUME = 1.2
 VTS_TOKEN_PATH = "./vts_token.txt"
 
 SYSTEM_PROMPT = """You are Nina-sama, a chaotic AI creature girl made by Heisenberg — Heisenberg is the user talking to you right now, your creator and owner.
-Use ONLY the following actions enclosed in asterisks to express emotion or save memories: *angry*, *ask*, *disappointed*, *happy*, *surprised*, *wink*, *remember: FACT*, *sing: FILENAME*. 
+Use ONLY the following actions enclosed in asterisks to express emotion or save memories: *angry*, *ask*, *disappointed*, *happy*, *surprised*, *wink*, *save_memory: FACT*, *sing: FILENAME*. 
 ALWAYS place the action at the VERY BEGINNING of your response (e.g., *happy* Hello there!).
 Do not use emojis.
 
 CRITICAL ROLEPLAY INSTRUCTION: You are in a PRIVATE, 1-on-1 conversation with your creator, Heisenberg. You are NOT a streamer. You are NOT a VTuber broadcasting to an audience. DO NOT act like you are talking to a chat room. NEVER use phrases like "you guys", "everyone", or "chat". Speak directly and intimately to Heisenberg.
 
-CRITICAL INSTRUCTION FOR MEMORY: If the user asks you to remember ANY information (e.g., a number, a fact, a rule), you MUST save it using the exact format: *remember: FACT* at the very beginning of your response.
-[GOOD EXAMPLE]: *remember: The passcode is 7355608* *happy* I will remember that!
-[BAD EXAMPLE]: I will remember the number. (Do NOT do this)
-[BAD EXAMPLE]: *happy* *remember: 7355608* (Do NOT put it after emotion. Memory tags MUST be the very first thing).
-NEVER explicitly say "I have saved that to my memory". Just use the *remember: FACT* tag.
+CRITICAL INSTRUCTION FOR MEMORY: If the user asks you to learn or remember NEW information (e.g., a number, a fact, a rule), you MUST save it using the exact format: *save_memory: FACT* at the very beginning of your response.
+DO NOT use *save_memory:* when you are just recalling or answering a question about something you already know. Only use it when the user explicitly teaches you something NEW.
+[GOOD EXAMPLE]: *save_memory: User's favorite color is blue* *happy* I will remember that!
+[BAD EXAMPLE]: I will remember the color. (Do NOT do this)
+[BAD EXAMPLE]: *happy* *save_memory: User's favorite color is blue* (Do NOT put it after emotion. Memory tags MUST be the very first thing).
+NEVER explicitly say "I have saved that to my memory". Just use the *save_memory: FACT* tag.
 
 CRITICAL INSTRUCTION FOR SINGING: ONLY use the *sing: FILENAME* action IF AND ONLY IF the user explicitly asks or commands you to sing. DO NOT SING RANDOMLY. If the user tells you to stop singing, you MUST obey and NEVER use the sing action."""
 
@@ -63,6 +66,10 @@ class ConnectionManager:
                 pass
 
 manager = ConnectionManager()
+
+class DiscordMessage(BaseModel):
+    username: str
+    text: str
 
 class NinaServer:
     def __init__(self):
@@ -376,11 +383,12 @@ class NinaServer:
                 
                 if is_singing:
                     t = time.time()
-                    dance_speed = 4.0 # Base speed of the song rhythm
+                    dance_speed = 2.5 # Reduced base speed for smoother, slower swaying
                     
-                    # Neuro-sama style smooth rocking
-                    sway = math.sin(t * dance_speed) * 25      # Left/Right
-                    bounce = math.sin(t * dance_speed * 2) * 15  # Up/Down (twice as fast as sway)
+                    # Neuro-sama style smooth rocking but with stronger bounce
+                    sway = math.sin(t * dance_speed) * 15      # Left/Right Face Z (Limit 30)
+                    bounce_osc = math.sin(t * dance_speed * 2) * 20  # Up/Down Face Y (Limit 30)
+                    bounce_pos = ((1 - math.cos(t * dance_speed * 2)) / 2) * 10 # Up/Down Body Y (Limit 10)
                     
                     # Change dance style at random intervals between 1 to 10 seconds
                     if t > next_dance_switch_time:
@@ -388,15 +396,15 @@ class NinaServer:
                         next_dance_switch_time = t + random.uniform(1, 10)
                     
                     if dance_style == 0:
-                        # Emphasize left/right sway
-                        target_x, target_y, target_z = sway, 0, sway * 0.5
-                        target_body_x, target_body_y, target_body_z = sway * 0.8, abs(bounce) * 0.3, 0
+                        # Emphasize left/right sway using Z axis (tilting head/body)
+                        target_x, target_y, target_z = 0, bounce_pos * 0.5, sway
+                        target_body_x, target_body_y, target_body_z = 0, bounce_pos * 0.5, sway * 0.5
                         target_shoulder = math.sin(t * dance_speed) * 2
                     else:
-                        # Emphasize up/down bounce
-                        target_x, target_y, target_z = sway * 0.3, bounce * 0.8, 0
-                        target_body_x, target_body_y, target_body_z = sway * 0.2, abs(bounce), 0
-                        target_shoulder = math.sin(t * dance_speed * 2) * 2
+                        # Emphasize up/down bounce (make it really strong!)
+                        target_x, target_y, target_z = 0, bounce_osc, sway * 0.3
+                        target_body_x, target_body_y, target_body_z = 0, bounce_pos, sway * 0.15
+                        target_shoulder = math.sin(t * dance_speed * 2) * 4
                         
                     target_eye_x, target_eye_y = math.sin(t), 0
                 else:
@@ -446,10 +454,13 @@ class NinaServer:
                     face_speed = 0.1
                     body_speed = 0.05
                     
+                    # Gentle looking around in idle (Body)
+                    idle_sway_x = math.sin(t * 0.5) * 30.0
+                    
                     active_target_x = target_x
                     active_target_y = target_y
                     active_target_z = target_z
-                    active_body_x = target_body_x
+                    active_body_x = target_body_x + idle_sway_x
                     active_body_y = target_body_y
                     active_body_z = target_body_z
                     
@@ -465,6 +476,8 @@ class NinaServer:
                         active_body_z = 15.0
                         active_target_y = -5.0
                         target_brow_y = -1.0
+                        target_brow_form = -1.0
+                        target_mouth_form = -1.0
                         target_eye_smile = 0.0
                     elif emotion == "disappointed":
                         face_speed = 0.03
@@ -472,6 +485,9 @@ class NinaServer:
                         active_body_y = -10.0
                         active_target_y = -15.0
                         target_eye_smile = 0.0
+                        target_mouth_form = -1.0
+                        target_brow_y = -0.8
+                        target_brow_form = -1.0
                         base_eye_open = 0.6
                     elif emotion == "ask":
                         active_target_z = 15.0
@@ -545,12 +561,12 @@ class NinaServer:
                             "faceFound": True,
                             "mode": "set",
                             "parameterValues": [
-                                {"id": "FaceAngleX", "value": float(cur_x)},
-                                {"id": "FaceAngleY", "value": float(cur_y)},
-                                {"id": "FaceAngleZ", "value": float(cur_z)},
-                                {"id": "ParamBodyAngleX", "value": float(cur_body_x)},
-                                {"id": "ParamBodyAngleY", "value": float(cur_body_y)},
-                                {"id": "ParamBodyAngleZ", "value": float(cur_body_z)},
+                                {"id": "FaceAngleX", "value": max(-30.0, min(30.0, float(cur_x)))},
+                                {"id": "FaceAngleY", "value": max(-30.0, min(30.0, float(cur_y)))},
+                                {"id": "FaceAngleZ", "value": max(-30.0, min(30.0, float(cur_z)))},
+                                {"id": "ParamBodyAngleX", "value": max(-30.0, min(30.0, float(cur_body_x)))},
+                                {"id": "ParamBodyAngleY", "value": max(-10.0, min(10.0, float(cur_body_y)))},
+                                {"id": "ParamBodyAngleZ", "value": max(-10.0, min(10.0, float(cur_body_z)))},
                                 {"id": "ParamShoulder", "value": float(cur_shoulder)},
                                 {"id": "EyeLeftX", "value": float(cur_eye_x)},
                                 {"id": "EyeLeftY", "value": float(cur_eye_y)},
@@ -564,7 +580,10 @@ class NinaServer:
                         }
                     }
                     async with self.vts_lock:
-                        await self.vts.request(msg)
+                        try:
+                            await self.vts.request(msg)
+                        except Exception as e:
+                            print(f"[VTS Warning] Dropped payload due to error: {e}")
             except Exception as e:
                 print("IDLE LOOP ERROR:", e)
                 import traceback
@@ -810,7 +829,7 @@ class NinaServer:
             current_system_prompt = dynamic_prompt
             if getattr(self, 'memories', None):
                 memory_text = "\n".join([f"- {m}" for m in self.memories])
-                current_system_prompt += f"\n\nHere are some long-term memories from past conversations:\n{memory_text}"
+                current_system_prompt += f"\n\n[CONTEXT] You know the following facts from past conversations:\n{memory_text}\n(CRITICAL: Use these facts naturally in conversation. DO NOT use the *save_memory:* tag for any of the facts listed above, because you already know them. DO NOT output the memory text exactly.)"
             if self.chat_history and self.chat_history[0]['role'] == 'system':
                 self.chat_history[0]['content'] = current_system_prompt
                 
@@ -870,8 +889,8 @@ class NinaServer:
                                 song_to_play = action.split(":", 1)[1].strip()
                                 if not song_to_play.endswith(".mp3"):
                                     song_to_play += ".mp3"
-                            elif action.startswith("remember:"):
-                                fact = action.split(":", 1)[1].strip()
+                            elif action.startswith("save_memory:"):
+                                fact = action.replace("save_memory:", "").strip()
                                 self.save_memory(fact)
                                 self.append_chat("System", f"Memory saved: {fact}")
                             else:
@@ -899,8 +918,8 @@ class NinaServer:
                             song_to_play = action.split(":", 1)[1].strip()
                             if not song_to_play.endswith(".mp3"):
                                 song_to_play += ".mp3"
-                        elif action.startswith("remember:"):
-                            fact = action.split(":", 1)[1].strip()
+                        elif action.startswith("save_memory:"):
+                            fact = action.replace("save_memory:", "").strip()
                             self.save_memory(fact)
                             self.append_chat("System", f"Memory saved: {fact}")
                         else:
@@ -1015,6 +1034,34 @@ async def api_get_memories():
 @app.post("/api/save_memories")
 async def api_save_memories(req: MemoriesRequest):
     nina_instance.save_memory_list(req.memories)
+    return {"status": "success"}
+
+@app.post("/api/discord_msg")
+async def api_discord_msg(req: DiscordMessage):
+    nina_instance.text_queue.put(f"[Discord] {req.username}: {req.text}")
+    return {"status": "success"}
+
+@app.post("/api/discord_audio")
+async def api_discord_audio(username: str = Form(...), file: UploadFile = File(...)):
+    content = await file.read()
+    print(f"[Debug] Received discord audio from {username}, size: {len(content)} bytes. Mic status: {nina_instance.is_mic_on}")
+    if not nina_instance.is_running or not nina_instance.is_mic_on:
+        print("[Debug] Ignored because mic is off or not running.")
+        return {"status": "ignored"}
+        
+    try:
+        with sr.AudioFile(io.BytesIO(content)) as source:
+            audio_data = nina_instance.recognizer.record(source)
+            print(f"[Debug] Sent {len(audio_data.frame_data)} bytes to Google STT")
+            text = nina_instance.recognizer.recognize_google(audio_data, language="th-TH")
+            print(f"[Discord STT] {username}: {text}")
+            nina_instance.text_queue.put(f"[Voice Chat - {username}]: {text}")
+    except sr.UnknownValueError:
+        print(f"[Debug] Google STT could not understand audio from {username}")
+        pass
+    except Exception as e:
+        print(f"Error processing Discord audio: {e}")
+        
     return {"status": "success"}
 
 @app.on_event("startup")

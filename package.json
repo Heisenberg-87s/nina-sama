@@ -1,0 +1,31 @@
+{
+  "name": "kokoro",
+  "version": "1.0.0",
+  "description": "This repository contains the backend and UI for Nina-sama, a chaotic AI VTuber integrated with VTube Studio, Ollama, and Kokoro ONNX for text-to-speech.",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Heisenberg-87s/nina-sama.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/Heisenberg-87s/nina-sama/issues"
+  },
+  "homepage": "https://github.com/Heisenberg-87s/nina-sama#readme",
+  "dependencies": {
+    "@discordjs/opus": "^0.10.0",
+    "@discordjs/voice": "^0.19.2",
+    "@snazzah/davey": "^0.1.11",
+    "discord.js": "^14.26.4",
+    "ffmpeg-static": "^5.3.0",
+    "form-data": "^4.0.6",
+    "libsodium-wrappers": "^0.8.4",
+    "opusscript": "^0.0.8"
+  }
+}

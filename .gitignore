@@ -13,3 +13,4 @@ venv/
 memories.json
 songs/
 voice-trainning/
+node_modules/
