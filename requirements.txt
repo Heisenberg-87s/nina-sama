@@ -11,3 +11,4 @@ miniaudio
 ddgs
 Pillow
 faster-whisper
+python-multipart
