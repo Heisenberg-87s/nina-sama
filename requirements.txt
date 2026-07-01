@@ -10,3 +10,4 @@ kokoro-onnx
 miniaudio
 ddgs
 Pillow
+faster-whisper
