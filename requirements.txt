@@ -8,3 +8,5 @@ numpy
 SpeechRecognition
 kokoro-onnx
 miniaudio
+ddgs
+Pillow

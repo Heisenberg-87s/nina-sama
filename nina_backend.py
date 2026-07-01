@@ -13,10 +13,12 @@ import urllib.request
 import json
 import io
 import uvicorn
+from PIL import ImageGrab
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, File, UploadFile, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from ollama import Client
+from ddgs import DDGS
 
 main_loop = None
 from kokoro_onnx import Kokoro
@@ -29,9 +31,10 @@ VOICE = "neuro_sama"
 PITCH = 0
 VOLUME = 1.2
 VTS_TOKEN_PATH = "./vts_token.txt"
+SEARCH_COOLDOWN_SECONDS = 5  # minimum seconds between DuckDuckGo searches to avoid rate-limit blocks
 
 SYSTEM_PROMPT = """You are Nina-sama, a chaotic AI creature girl made by Heisenberg — Heisenberg is the user talking to you right now, your creator and owner.
-Use ONLY the following actions enclosed in asterisks to express emotion or save memories: *angry*, *ask*, *disappointed*, *happy*, *surprised*, *wink*, *save_memory: FACT*, *sing: FILENAME*. 
+Use ONLY the following actions enclosed in asterisks to express emotion or save memories: *angry*, *ask*, *disappointed*, *happy*, *surprised*, *wink*, *save_memory: FACT*, *sing: FILENAME*, *search: QUERY*. 
 ALWAYS place the action at the VERY BEGINNING of your response (e.g., *happy* Hello there!).
 Do not use emojis.
 
@@ -45,6 +48,13 @@ DO NOT use *save_memory:* when you are just recalling or answering a question ab
 NEVER explicitly say "I have saved that to my memory". Just use the *save_memory: FACT* tag.
 
 CRITICAL INSTRUCTION FOR SINGING: ONLY use the *sing: FILENAME* action IF AND ONLY IF the user explicitly asks or commands you to sing. DO NOT SING RANDOMLY. If the user tells you to stop singing, you MUST obey and NEVER use the sing action."""
+
+VISION_TRIGGER_PATTERN = re.compile(
+    r'(look at|check out|see).{0,15}(screen|monitor|this)|'
+    r'what.?s? (on|happening on) (my|the) screen|'
+    r'ดู(หน้าจอ|จอ|นี่สิ|นี่หน่อย)|มองจอ|มองหน้าจอ|เห็นจอ.?ไหม|ดูสิ.?ว่า',
+    re.IGNORECASE
+)
 
 class ConnectionManager:
     def __init__(self):
@@ -81,6 +91,7 @@ class NinaServer:
         self.last_interaction_time = time.time()
         self.current_emotion = "neutral"
         self.emotion_timer = time.time()
+        self.last_search_time = 0
         
         self.ollama_client = Client(host='http://localhost:11434')
         self.kokoro = None
@@ -90,6 +101,10 @@ class NinaServer:
         self.text_queue = queue.Queue()
         self.expression_queue = queue.Queue()
         self.current_mouth_open = 0.0
+        
+        self.bass_env = 0.0
+        self.mid_env = 0.0
+        self.treble_env = 0.0
         
         self.chat_history = []
         
@@ -144,6 +159,152 @@ class NinaServer:
             self.broadcast_sync("memories_updated", self.memories)
         except Exception as e:
             print(f"Error saving memory list: {e}")
+
+    def analyze_screen(self):
+        try:
+            # 1. Unload the main LLM from VRAM to make room for the vision model
+            try:
+                self.ollama_client.generate(model='nina-sama', prompt='', keep_alive=0)
+            except Exception as e:
+                print(f"Notice: Failed to unload nina-sama: {e}")
+
+            img = ImageGrab.grab()
+            img = img.convert("RGB")
+            img.thumbnail((1280, 1280))  # keep inference reasonably fast
+            
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=85)
+            img_bytes = buf.getvalue()
+            
+            # 2. Run moondream on GPU, then immediately unload it so nina-sama can reload later
+            response = self.ollama_client.chat(
+                model='moondream',
+                messages=[{
+                    'role': 'user',
+                    'content': 'Describe what is currently visible on this screen in 2-3 concise sentences. Mention the app/window, any visible text, and the main content.',
+                    'images': [img_bytes]
+                }],
+                keep_alive=0
+            )
+            return response['message']['content'].strip()
+        except Exception as e:
+            print(f"Vision Error: {e}")
+            self.append_chat("System", f"Vision error: {e}")
+            return None
+
+    def web_search(self, query, max_results=3):
+        """Search the web using DuckDuckGo. Returns (results_or_None, on_cooldown_bool)."""
+        now = time.time()
+        elapsed = now - getattr(self, 'last_search_time', 0)
+        if elapsed < SEARCH_COOLDOWN_SECONDS:
+            print(f"Search cooldown active ({SEARCH_COOLDOWN_SECONDS - elapsed:.1f}s remaining), skipping search for: {query}")
+            return None, True
+
+        self.last_search_time = now
+        try:
+            results = []
+            with DDGS() as ddgs:
+                for r in ddgs.text(query, max_results=max_results):
+                    results.append(f"- {r['title']}: {r['body']} ({r['href']})")
+            return ("\n".join(results) if results else None), False
+        except Exception as e:
+            print(f"Search Error: {e}")
+            return None, False
+
+    def _stream_and_speak(self, action_pattern, chunk_end):
+        """Stream LLM response, parse actions, speak text. Returns (full_response, song_to_play)."""
+        response = self.ollama_client.chat(
+            model='nina-sama',
+            messages=self.chat_history,
+            stream=True,
+            options={
+                'temperature': 0.85,
+                'repeat_penalty': 1.15
+            }
+        )
+        full_response = ""
+        buffer = ""
+        song_to_play = None
+
+        self.set_status("Nina is speaking...")
+        self.broadcast_sync("stream_start", "Nina")
+
+        for chunk in response:
+            if getattr(self, 'is_interrupted', False):
+                self.set_status("Interrupted")
+                break
+            token = chunk['message']['content']
+            full_response += token
+            buffer += token
+            self.broadcast_sync("stream_chunk", token)
+
+            if chunk_end.search(token):
+                actions_to_toggle = []
+                for match in action_pattern.finditer(buffer):
+                    action = match.group(1) or match.group(2)
+                    if action:
+                        actions_to_toggle.append(action)
+
+                clean_text = action_pattern.sub('', buffer).strip()
+
+                if clean_text:
+                    first_word = clean_text.split()[0].lower().strip("',.?!")
+                    question_words = ["what", "when", "where", "why", "who", "how", "did", "do", "does", "is", "are", "can", "could", "would", "should"]
+                    if any(first_word.startswith(qw) for qw in question_words):
+                        if "ask" not in actions_to_toggle:
+                            actions_to_toggle.append("ask")
+
+                for action in actions_to_toggle:
+                    if action.startswith("sing:"):
+                        song_to_play = action.split(":", 1)[1].strip()
+                        if not song_to_play.endswith(".mp3"):
+                            song_to_play += ".mp3"
+                    elif action.startswith("save_memory:"):
+                        fact = action.replace("save_memory:", "").strip()
+                        self.save_memory(fact)
+                        self.append_chat("System", f"Memory saved: {fact}")
+                    elif action.startswith("search:"):
+                        pass
+                    else:
+                        self.expression_queue.put(action)
+
+                if clean_text and any(c.isalnum() for c in clean_text):
+                    self.speak_blocking(clean_text)
+
+                for action in actions_to_toggle:
+                    if not action.startswith("sing:") and not action.startswith("search:"):
+                        self.expression_queue.put(action)
+
+                buffer = ""
+
+        if buffer.strip():
+            actions_to_toggle = []
+            for match in action_pattern.finditer(buffer):
+                action = match.group(1) or match.group(2)
+                if action:
+                    actions_to_toggle.append(action)
+
+            clean_text = action_pattern.sub('', buffer).strip()
+            for action in actions_to_toggle:
+                if action.startswith("sing:"):
+                    song_to_play = action.split(":", 1)[1].strip()
+                    if not song_to_play.endswith(".mp3"):
+                        song_to_play += ".mp3"
+                elif action.startswith("save_memory:"):
+                    fact = action.replace("save_memory:", "").strip()
+                    self.save_memory(fact)
+                    self.append_chat("System", f"Memory saved: {fact}")
+                elif action.startswith("search:"):
+                    pass
+                else:
+                    self.expression_queue.put(action)
+            if clean_text and any(c.isalnum() for c in clean_text):
+                self.speak_blocking(clean_text)
+            for action in actions_to_toggle:
+                if not action.startswith("sing:") and not action.startswith("search:"):
+                    self.expression_queue.put(action)
+
+        return full_response, song_to_play
 
     def broadcast_sync(self, msg_type, content):
         global main_loop
@@ -280,8 +441,7 @@ class NinaServer:
             custom_params = [
                 {"name": "ParamBodyAngleX", "min": -10, "max": 10, "def": 0},
                 {"name": "ParamBodyAngleY", "min": -10, "max": 10, "def": 0},
-                {"name": "ParamBodyAngleZ", "min": -10, "max": 10, "def": 0},
-                {"name": "ParamShoulder", "min": -1, "max": 1, "def": 0}
+                {"name": "ParamBodyAngleZ", "min": -10, "max": 10, "def": 0}
             ]
             for cp in custom_params:
                 await self.vts.request({
@@ -351,8 +511,7 @@ class NinaServer:
         cur_body_x, cur_body_y, cur_body_z = 0.0, 0.0, 0.0
         target_body_x, target_body_y, target_body_z = 0.0, 0.0, 0.0
         
-        cur_shoulder = 0.0
-        target_shoulder = 0.0
+
         
         cur_eye_x, cur_eye_y = 0.0, 0.0
         target_eye_x, target_eye_y = 0.0, 0.0
@@ -383,12 +542,21 @@ class NinaServer:
                 
                 if is_singing:
                     t = time.time()
-                    dance_speed = 2.5 # Reduced base speed for smoother, slower swaying
+                    dt = t - getattr(self, 'last_dance_t', t)
+                    self.last_dance_t = t
                     
-                    # Neuro-sama style smooth rocking but with stronger bounce
-                    sway = math.sin(t * dance_speed) * 15      # Left/Right Face Z (Limit 30)
-                    bounce_osc = math.sin(t * dance_speed * 2) * 20  # Up/Down Face Y (Limit 30)
-                    bounce_pos = ((1 - math.cos(t * dance_speed * 2)) / 2) * 10 # Up/Down Body Y (Limit 10)
+                    b_env = getattr(self, 'bass_env', 0.0)
+                    m_env = getattr(self, 'mid_env', 0.0)
+                    t_env = getattr(self, 'treble_env', 0.0)
+                    
+                    # Dynamic speed: base speed + speed burst from overall audio energy
+                    current_speed = 1.5 + (b_env * 2.0 + m_env * 2.0)
+                    self.dance_phase = getattr(self, 'dance_phase', 0.0) + current_speed * dt
+                    dp = self.dance_phase
+                    
+                    sway = math.sin(dp) * (6.0 + b_env * 28.0)
+                    bounce_osc = math.sin(dp * 2) * (8.0 + m_env * 32.0)
+                    bounce_pos = ((1 - math.cos(dp * 2)) / 2) * (4.0 + b_env * 24.0)
                     
                     # Change dance style at random intervals between 1 to 10 seconds
                     if t > next_dance_switch_time:
@@ -399,12 +567,10 @@ class NinaServer:
                         # Emphasize left/right sway using Z axis (tilting head/body)
                         target_x, target_y, target_z = 0, bounce_pos * 0.5, sway
                         target_body_x, target_body_y, target_body_z = 0, bounce_pos * 0.5, sway * 0.5
-                        target_shoulder = math.sin(t * dance_speed) * 2
                     else:
                         # Emphasize up/down bounce (make it really strong!)
                         target_x, target_y, target_z = 0, bounce_osc, sway * 0.3
                         target_body_x, target_body_y, target_body_z = 0, bounce_pos, sway * 0.15
-                        target_shoulder = math.sin(t * dance_speed * 2) * 4
                         
                     target_eye_x, target_eye_y = math.sin(t), 0
                 else:
@@ -428,7 +594,7 @@ class NinaServer:
                         target_body_x = random.uniform(-fidget_range_x, fidget_range_x)
                         target_body_y = random.uniform(-fidget_range_y, fidget_range_y)
                         target_body_z = random.uniform(-fidget_range_z, fidget_range_z)
-                        target_shoulder = random.uniform(-0.5, 0.5)
+
                         target_eye_x, target_eye_y = random.uniform(-1, 1), random.uniform(-0.5, 0.5)
                         
                         target_mouth_form = random.uniform(0.7, 1.0)
@@ -519,7 +685,7 @@ class NinaServer:
                 cur_body_x += (active_body_x - cur_body_x) * body_speed
                 cur_body_y += (active_body_y - cur_body_y) * body_speed
                 cur_body_z += (active_body_z - cur_body_z) * body_speed
-                cur_shoulder += (target_shoulder - cur_shoulder) * body_speed
+
                 
                 cur_eye_x += (target_eye_x - cur_eye_x) * 0.2
                 cur_eye_y += (target_eye_y - cur_eye_y) * 0.2
@@ -567,7 +733,7 @@ class NinaServer:
                                 {"id": "ParamBodyAngleX", "value": max(-30.0, min(30.0, float(cur_body_x)))},
                                 {"id": "ParamBodyAngleY", "value": max(-10.0, min(10.0, float(cur_body_y)))},
                                 {"id": "ParamBodyAngleZ", "value": max(-10.0, min(10.0, float(cur_body_z)))},
-                                {"id": "ParamShoulder", "value": float(cur_shoulder)},
+
                                 {"id": "EyeLeftX", "value": float(cur_eye_x)},
                                 {"id": "EyeLeftY", "value": float(cur_eye_y)},
                                 {"id": "EyeRightX", "value": float(cur_eye_x)},
@@ -727,6 +893,38 @@ class NinaServer:
                 audio = (samples.astype(np.float32) / 32768.0) * VOLUME
                 return audio.reshape(-1, 1)
 
+            # Manual tuning factors for FFT magnitude to 0.0-1.0 range
+            SCALE_BASS = 0.015
+            SCALE_MID = 0.02
+            SCALE_TREBLE = 0.03
+
+            def process_fft_chunk(chunk):
+                chunk_1d = chunk.flatten()
+                N = len(chunk_1d)
+                if N < 10: return
+                window = np.hanning(N)
+                spectrum = np.abs(np.fft.rfft(chunk_1d * window))
+                
+                freq_per_bin = 24000 / N
+                bass_end = max(1, int(250 / freq_per_bin))
+                mid_end = max(bass_end + 1, int(2000 / freq_per_bin))
+                treble_end = max(mid_end + 1, int(8000 / freq_per_bin))
+                
+                bass_raw = np.max(spectrum[1:bass_end]) if len(spectrum[1:bass_end]) > 0 else 0
+                mid_raw = np.max(spectrum[bass_end:mid_end]) if len(spectrum[bass_end:mid_end]) > 0 else 0
+                treble_raw = np.max(spectrum[mid_end:treble_end]) if len(spectrum[mid_end:treble_end]) > 0 else 0
+                
+                b = min(1.0, float(bass_raw) * SCALE_BASS)
+                m = min(1.0, float(mid_raw) * SCALE_MID)
+                t_val = min(1.0, float(treble_raw) * SCALE_TREBLE)
+                
+                attack = 0.7
+                release = 0.1
+                
+                self.bass_env += (b - getattr(self, 'bass_env', 0.0)) * (attack if b > getattr(self, 'bass_env', 0.0) else release)
+                self.mid_env += (m - getattr(self, 'mid_env', 0.0)) * (attack if m > getattr(self, 'mid_env', 0.0) else release)
+                self.treble_env += (t_val - getattr(self, 'treble_env', 0.0)) * (attack if t_val > getattr(self, 'treble_env', 0.0) else release)
+
             if is_dual:
                 vocal_audio = decode_audio(vocal_path)
                 inst_audio = decode_audio(inst_path)
@@ -761,6 +959,7 @@ class NinaServer:
                                 if not getattr(self, 'is_running', False) or getattr(self, 'is_interrupted', False):
                                     break
                                 chunk = inst_audio[i:i+chunk_size]
+                                process_fft_chunk(chunk)
                                 stream.write(chunk)
                     except Exception as e:
                         print(f"Inst Stream Error: {e}")
@@ -786,6 +985,7 @@ class NinaServer:
                                 rms = np.sqrt(np.mean(np.square(chunk)))
                                 target_open = min(1.0, (rms - 0.02) * 6) if rms > 0.02 else 0.0
                                 self.current_mouth_open += (target_open - self.current_mouth_open) * 0.6
+                                process_fft_chunk(chunk)
                                 stream.write(chunk)
                     except Exception as e:
                         print(f"Stream Error in song: {e}")
@@ -796,7 +996,11 @@ class NinaServer:
                 
             self.is_speaking_audio = False
             self.is_singing = False
-            self.set_status("Ready")
+            self.bass_env = 0.0
+            self.mid_env = 0.0
+            self.treble_env = 0.0
+            self.prev_bass_env = 0.0
+            self.set_status("Finished singing")
             
         except Exception as e:
             self.is_speaking_audio = False
@@ -823,6 +1027,10 @@ class NinaServer:
                 song_list = ", ".join(list(song_names))
                 dynamic_prompt += f"\n\n[SPECIAL ACTION AVAILABLE]\nYou have access to the following songs: [{song_list}]. If, and ONLY IF, the user explicitly asks you to sing a song, you can perform the action *sing:FILENAME* where FILENAME is the exact name of the song from the list. DO NOT sing randomly. DO NOT output lyrics."
                 
+        dynamic_prompt += "\n\n[VISION CAPABILITY]\nSometimes a user message will contain a [SCREEN CONTEXT] section describing what's currently on Heisenberg's screen. This is real — you can actually see his screen when this appears. React naturally to it, like you're genuinely looking. Do NOT mention the bracket tag itself."
+
+        dynamic_prompt += "\n\n[SEARCH CAPABILITY]\nYou can search the internet using *search: QUERY* — place it at the VERY BEGINNING of your response, BEFORE any other text or emotion tag. Use this ONLY when:\n- The user asks about current events, news, or real-time information you cannot know\n- You encounter a name, term, or topic you are genuinely not confident about\n- The user explicitly asks you to look something up or search for something\n- You need to verify a fact you are uncertain about\nWhen you decide to search, output ONLY the search tag and nothing else (e.g. *search: who is Vedal987*). Do NOT guess or make up an answer first — just output the search tag. The system will fetch results and you will get a chance to respond with real data.\nIMPORTANT: Do NOT search for things you already know well. Only search when genuinely uncertain or when asked."
+                
         self.chat_history = [{"role": "system", "content": dynamic_prompt}]
         
         while getattr(self, 'is_running', False):
@@ -837,108 +1045,54 @@ class NinaServer:
                 text = self.text_queue.get(timeout=1)
             except queue.Empty:
                 continue
-                
+
+            if VISION_TRIGGER_PATTERN.search(text):
+                self.set_status("Nina is looking at the screen (this may take a moment)...")
+                caption = self.analyze_screen()
+                if caption:
+                    text += f"\n\n[SCREEN CONTEXT - this is what you currently see on screen, respond naturally as if you're looking at it]: {caption}"
+
             self.set_status("Nina is thinking...")
             self.chat_history.append({"role": "user", "content": text})
             
             try:
                 self.is_interrupted = False
-                response = self.ollama_client.chat(
-                    model='nina-sama', 
-                    messages=self.chat_history, 
-                    stream=True,
-                    options={
-                        'temperature': 0.85,
-                        'repeat_penalty': 1.15
-                    }
-                )
-                full_response = ""
-                buffer = ""
-                song_to_play = None
-                
-                self.set_status("Nina is speaking...")
-                self.broadcast_sync("stream_start", "Nina")
-                
-                for chunk in response:
-                    if getattr(self, 'is_interrupted', False):
-                        self.set_status("Interrupted")
-                        break
-                    token = chunk['message']['content']
-                    full_response += token
-                    buffer += token
-                    self.broadcast_sync("stream_chunk", token)
-                    
-                    if chunk_end.search(token):
-                        actions_to_toggle = []
-                        for match in action_pattern.finditer(buffer):
-                            action = match.group(1) or match.group(2)
-                            if action:
-                                actions_to_toggle.append(action)
-                        
-                        clean_text = action_pattern.sub('', buffer).strip()
-                        
-                        if clean_text:
-                            first_word = clean_text.split()[0].lower().strip("',.?!")
-                            question_words = ["what", "when", "where", "why", "who", "how", "did", "do", "does", "is", "are", "can", "could", "would", "should"]
-                            if any(first_word.startswith(qw) for qw in question_words):
-                                if "ask" not in actions_to_toggle:
-                                    actions_to_toggle.append("ask")
-                                    
-                        for action in actions_to_toggle:
-                            if action.startswith("sing:"):
-                                song_to_play = action.split(":", 1)[1].strip()
-                                if not song_to_play.endswith(".mp3"):
-                                    song_to_play += ".mp3"
-                            elif action.startswith("save_memory:"):
-                                fact = action.replace("save_memory:", "").strip()
-                                self.save_memory(fact)
-                                self.append_chat("System", f"Memory saved: {fact}")
-                            else:
-                                self.expression_queue.put(action)
-                        
-                        if clean_text and any(c.isalnum() for c in clean_text):
-                            self.speak_blocking(clean_text)
-                            
-                        for action in actions_to_toggle:
-                            if not action.startswith("sing:"):
-                                self.expression_queue.put(action)
-                                
-                        buffer = ""
-                        
-                if buffer.strip():
-                    actions_to_toggle = []
-                    for match in action_pattern.finditer(buffer):
-                        action = match.group(1) or match.group(2)
-                        if action:
-                            actions_to_toggle.append(action)
-                            
-                    clean_text = action_pattern.sub('', buffer).strip()
-                    for action in actions_to_toggle:
-                        if action.startswith("sing:"):
-                            song_to_play = action.split(":", 1)[1].strip()
-                            if not song_to_play.endswith(".mp3"):
-                                song_to_play += ".mp3"
-                        elif action.startswith("save_memory:"):
-                            fact = action.replace("save_memory:", "").strip()
-                            self.save_memory(fact)
-                            self.append_chat("System", f"Memory saved: {fact}")
-                        else:
-                            self.expression_queue.put(action)
-                    if clean_text and any(c.isalnum() for c in clean_text):
-                        self.speak_blocking(clean_text)
-                    for action in actions_to_toggle:
-                        if not action.startswith("sing:"):
-                            self.expression_queue.put(action)
+
+                # --- Pass 1: Generate response (may contain *search: QUERY*) ---
+                full_response, song_to_play = self._stream_and_speak(action_pattern, chunk_end)
+
+                # --- Check if Nina wants to search ---
+                search_match = re.search(r'\*search:\s*(.+?)\*', full_response)
+                if search_match:
+                    search_query = search_match.group(1).strip()
+                    self.set_status(f"Nina is searching: {search_query}...")
+                    self.broadcast_sync("stream_end", None)
+
+                    search_results, on_cooldown = self.web_search(search_query)
+
+                    # Record pass-1 attempt and inject search results
+                    self.chat_history.append({"role": "assistant", "content": full_response.strip()})
+                    if search_results:
+                        self.chat_history.append({"role": "user", "content": f"[SEARCH RESULTS for '{search_query}']:\n{search_results}\n\n(Now answer the original question using these search results. Respond naturally and conversationally — do NOT just list the results. Start with an emotion tag as usual.)"})
+                    elif on_cooldown:
+                        self.chat_history.append({"role": "user", "content": "[You searched too recently and need to wait a bit before searching again. Answer based on what you already know, and casually let Heisenberg know you can't search again just yet.]"})
+                    else:
+                        self.chat_history.append({"role": "user", "content": "[Search returned no results. Answer based on what you know, and let Heisenberg know you tried to search but couldn't find anything.]"})
+
+                    # --- Pass 2: Generate final answer with search context ---
+                    self.set_status("Nina is thinking with search results...")
+                    self.is_interrupted = False
+                    full_response, song_to_play = self._stream_and_speak(action_pattern, chunk_end)
 
                 self.chat_history.append({"role": "assistant", "content": full_response.strip()})
                 self.broadcast_sync("stream_end", None)
-                
+
                 if song_to_play:
                     self.play_song_blocking(song_to_play)
-                    
+
                 self.last_interaction_time = time.time()
                 self.set_status("Ready")
-                
+
             except Exception as e:
                 self.append_chat("System", f"LLM Error: {e}")
                 self.set_status("Error")
